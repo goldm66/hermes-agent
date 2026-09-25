@@ -67,7 +67,10 @@ def _retry_empty(
         return None, None, deterministic
     agent._empty_content_retries += 1
     n = agent._empty_content_retries
-    wait_time = jittered_backoff(n, base_delay=5.0, max_delay=60.0)
+    # [local patch: fixed-retry-delay] 用户要求：重试间隔固定 3 秒，不递增、不加抖动。
+    # 恢复原状：删掉下面那行，取消本行注释。
+    # wait_time = jittered_backoff(n, base_delay=5.0, max_delay=60.0)
+    wait_time = 3.0
     logger.warning(
         "Empty response (no content or reasoning) — retry %d/%d in %.1fs (model=%s)",
         n, budget, wait_time, agent.model,

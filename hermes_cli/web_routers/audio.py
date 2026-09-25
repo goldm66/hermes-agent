@@ -17,6 +17,7 @@ import os
 import urllib.parse
 import urllib.request
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from hermes_cli.web_routers._common import http_failure
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
@@ -46,6 +47,10 @@ _SPEAK_MIME_BY_EXT = {
     ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav",
     ".flac": "audio/flac",
 }
+
+# How often /api/audio/speak emits a whitespace heartbeat while synthesising. Must stay
+# well under the desktop client's timeout(180_000 ms floor) so the socket never looks idle.
+_SPEAK_KEEPALIVE_SECONDS = float(os.environ.get("HERMES_SPEAK_KEEPALIVE_SECONDS", "20"))
 
 
 def _unlink_quietly(path: str) -> None:
@@ -288,11 +293,45 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     Used by the desktop voice-conversation mode to play back assistant
     responses without exposing the on-disk file path; reuses the TTS provider
     chain configured under ``tts.`` in config.yaml.
+
+    The response is STREAMED with a whitespace heartbeat. The desktop client's
+    ``req.setTimeout`` is a socket *inactivity* timeout, not a total-duration one, so a
+    single long blocking response dies with "Timed out connecting to Hermes backend after
+    180000ms" whenever local synthesis outruns the client's size-based budget (a local
+    model needs ~1200 ms/char against the client's 35 ms/char allowance). Emitting one
+    space every ``_SPEAK_KEEPALIVE_SECONDS`` keeps the socket active; leading whitespace
+    is legal before a JSON value, so the client's ``JSON.parse`` still succeeds and one
+    request can carry a full-length reply.
     """
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
+    async def _stream():
+        task = asyncio.ensure_future(_build_speak_response(text, profile))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_SPEAK_KEEPALIVE_SECONDS)
+                if done:
+                    break
+                yield b" "  # heartbeat: keeps the client socket from idling out
+            try:
+                body = task.result()
+            except HTTPException as exc:
+                body = {"ok": False, "error": exc.detail}
+            except Exception as exc:  # noqa: BLE001 - surface any synthesis failure as JSON
+                _log.warning("speak_text stream failed: %s", exc)
+                body = {"ok": False, "error": str(exc) or "Speech synthesis failed"}
+        finally:
+            if not task.done():
+                task.cancel()
+        yield json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    return StreamingResponse(_stream(), media_type="application/json")
+
+
+async def _build_speak_response(text: str, profile: Optional[str]) -> Dict[str, Any]:
+    """Synthesize ``text`` and base64-encode it; the original endpoint body."""
     # _config_profile_scope raises 400/404 for a bad profile — pass it
     # through instead of masking it as a 500 synthesis failure.
     with http_failure("Desktop voice TTS failed", 500, "Speech synthesis failed"):

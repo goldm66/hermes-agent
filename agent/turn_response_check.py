@@ -330,7 +330,10 @@ def retry_invalid_response(
             "failed": True,
         }, invalid_response_failure_reason(response), True))
 
-    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+    # [local patch: fixed-retry-delay] 用户要求：重试间隔固定 3 秒，不递增、不加抖动。
+    # 恢复原状：删掉下面那行，取消本行注释。
+    # wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+    wait_time = 3.0
     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
     logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
 

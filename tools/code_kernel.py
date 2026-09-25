@@ -674,9 +674,25 @@ def _acquire_kernel(key: Tuple, reset: bool, *, pinned: bool = False) -> Tuple[S
         expired = _pop_idle_expired(time.monotonic(), idle_timeout)
         kernel = _KERNELS.get(key)
         state_reset = kernel is not None and (reset or kernel.dead())
+        # [local patch: kernel-key-drift] `key` embeds `child_cwd` (see
+        # `execute_in_session_kernel`), and in `project` mode that cwd follows the
+        # terminal's `cd` state (`_resolve_child_cwd`). So one `cd` between two
+        # execute_code calls silently lands on a new key: the old kernel keeps the
+        # variables, the new one is empty, and the old code reported
+        # `reused=false, state_reset=false` — i.e. "nothing to lose" — until the
+        # caller hit an unexplained NameError. A live kernel under the SAME owner
+        # but a different key means this cell lost the previous state: say so.
+        if kernel is None and not state_reset:
+            # Two silent-loss paths, both reported as a reset so the caller is told the
+            # variables are gone instead of meeting a bare NameError: (a) a live kernel
+            # under the SAME owner but a different key (cwd/python/tools changed), and
+            # (b) this very key's kernel was idle/LRU-reaped at the top of this call.
+            state_reset = (any(k != key and k[0] == key[0] and not _KERNELS[k].dead()
+                               for k in _KERNELS)
+                           or any(dk.key == key for dk in expired))
         if state_reset:
-            dropped = _KERNELS.pop(key)
-            if dropped.attached == 0:
+            dropped = _KERNELS.pop(key, None)
+            if dropped is not None and dropped.attached == 0:
                 expired.append(dropped)
             kernel = None
         if kernel is None:
@@ -801,6 +817,16 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
         "kernel": {"mode": "session", "reused": reused,
                    "execution_count": kernel.execution_count, "state_reset": state_reset},
     }
+    # [local patch: kernel-key-drift] Make a lost kernel visible instead of letting the next
+    # cell die on a bare NameError: state_reset was previously reported (when at all) without
+    # saying what it means or what usually caused it.
+    if state_reset:
+        result["kernel_note"] = (
+            "Fresh kernel — this cell did NOT inherit the previous cell's variables. In `project` "
+            "mode the kernel key includes the working directory, so a `cd` in the terminal between "
+            "two execute_code calls silently switches kernels (idle/LRU recycling does the same). "
+            "Re-define anything you still need, or keep the cwd stable between related calls."
+        )
     result.update(stdout_metadata)
     # Cell-side spill (runner clipped before replying): same read_file recipe as the host-side spill.
     cell_spill = str(payload.get("stdout_spill_path", "") or "")

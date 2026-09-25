@@ -1419,9 +1419,15 @@ def compute_error_backoff(
             # past, which the parser clamps to 0.0) carries no usable wait —
             # treat it as absent so we never hot-loop the provider.
             _retry_after = None
-    wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    # [local patch: fixed-retry-delay] 用户要求：重试间隔固定 3 秒，不递增、不加抖动，忽略 Retry-After。
+    # 恢复原状：删掉下面那行，取消本行注释。
+    # wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    wait_time = 3.0
     _backoff_policy = None
-    _adaptive = is_rate_limited or is_zai_coding_overload
+    # [local patch: fixed-retry-delay] 关掉 429 / Z.AI 过载的自适应长退避（30→120s），
+    # 让所有重试都走上面的固定 3 秒。恢复原状：改回
+    #   _adaptive = is_rate_limited or is_zai_coding_overload
+    _adaptive = False
     if _adaptive and _retry_after is None:
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,

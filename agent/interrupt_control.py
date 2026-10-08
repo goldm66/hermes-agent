@@ -145,13 +145,13 @@ class InterruptControlMixin:
                 self._turn_liveness_abort_claim = require_generation
 
         # Tool cancellation attribution stays separate from _interrupt_message, which may carry the user's
-        # full next message. An explicit ``tool_reason`` wins on BOTH paths: a system producer that has to
-        # stop the turn SOFTLY (batch guards, watchdogs) previously had no way to label itself — passing a
-        # message made it look like "the user sent a new message", so the abort was attributed to the user
-        # and rendered as a user-stop placeholder (#130207).
-        tool_interrupt_reason = (
-            (tool_reason or _REASON_HARD_STOP) if hard_cancel
-            else (tool_reason or (_REASON_NEW_MESSAGE if message else _REASON_USER_INTERRUPT))
+        # full next message. An explicit ``tool_reason`` names the system producer (watchdog, tool-timeout
+        # cleanup, lease loss, lifecycle cancellation) and must win on BOTH paths: such an interrupt is not
+        # a human stop, so booking it as "user sent a new message" would misattribute it in the log, in the
+        # skipped-tool results and in the turn exit reason — exactly what #112647 set out to prevent.
+        tool_interrupt_reason = tool_reason or (
+            (_REASON_HARD_STOP if hard_cancel
+             else (_REASON_NEW_MESSAGE if message else _REASON_USER_INTERRUPT))
         )
 
         def _publish_interrupt_state() -> None:

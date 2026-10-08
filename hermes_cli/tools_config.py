@@ -3,6 +3,7 @@
 import json as _json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, NoReturn, Optional, Set
 
@@ -1083,6 +1084,17 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     print()
     if first_install:
         _first_install_flow(config, enabled_platforms)
+        return
+
+    # Non-interactive stdin (piped output, cron, or an agent tool call): every menu below returns
+    # its cancel value immediately, so this platform-menu loop would pick the default row forever
+    # and spin without ever exiting — the caller hangs until it is killed. Print the summary
+    # instead of driving a menu nobody can answer.
+    if not sys.stdin.isatty():
+        print(color(
+            "  Non-interactive stdin — showing the current tool summary; "
+            "run `hermes tools` in a terminal to change it.", Colors.DIM))
+        _print_tools_summary(config, enabled_platforms)
         return
 
     # Returning user: platform menu loop. Per-platform rows first, then the extras in this order.

@@ -237,6 +237,25 @@ def _recover_final_from_stream(agent, final_response, interrupted, failed) -> Tu
     return final_response, False
 
 
+def _interrupted_tail_placeholder(agent) -> str:
+    """Text for the synthetic closing assistant row when an interrupted turn produced no reply.
+
+    The row exists for role alternation, but the user reads it too: a bare "Operation
+    interrupted." makes a system-issued stop (tool timeout, watchdog, lease loss)
+    indistinguishable from a human one, and the turn reads as having died for no reason.
+    Name the issuer whenever there is one; keep the historic spelling otherwise.
+    """
+    detail = getattr(agent, "_tool_interrupt_reason", None)
+    try:
+        from agent.interrupt_control import interrupt_issuer
+        issuer = interrupt_issuer(agent)
+    except Exception:
+        issuer = None
+    if detail and issuer:
+        return f"Operation interrupted: {detail}."
+    return "Operation interrupted."
+
+
 def _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream) -> None:
     """Shape the transcript tail before the durable snapshot (scaffolding already dropped
     and ``final_response`` already stream-recovered by the caller)."""
@@ -244,7 +263,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
         from agent.message_sanitization import close_interrupted_tool_sequence
-        close_interrupted_tool_sequence(messages, final_response)
+        _tail_text = final_response if isinstance(final_response, str) else ""
+        close_interrupted_tool_sequence(
+            messages, _tail_text.strip() or _interrupted_tail_placeholder(agent))
 
     # Recovery ``break`` sites can return a final_response with no closing assistant
     # row; enforce "delivered final_response ⇒ assistant row" here. Compare content,

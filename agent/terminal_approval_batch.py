@@ -310,12 +310,8 @@ def terminal_approval_batch(agent, calls, messages, task_id):
                 batch.start()
             except (_CancelledPreparation, TimeoutError) as exc:
                 batch.close()
-                # A cancellation means a stop is already published (or our own
-                # close() ran): re-interrupting would overwrite the user's queued
-                # message/redirect. A timeout is a system stop: tool_reason only, no
-                # message (callers re-queue _interrupt_message as the user's next turn).
-                if isinstance(exc, TimeoutError):
-                    agent.interrupt(tool_reason="terminal batch preparation timeout")
+                # System-issued interrupt (preparation cancelled/timed out), not a human stop.
+                agent.interrupt(str(exc), tool_reason="terminal approval preparation cancelled")
                 # The sequential path must still persist a result for every
                 # assistant tool call, even if preparation never finished.
         yield

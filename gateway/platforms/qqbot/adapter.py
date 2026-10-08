@@ -40,7 +40,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
-    gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
+    gateway_trust_env, resolve_proxy_url, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
     _ssrf_redirect_guard, cache_document_from_bytes_async, cache_image_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType
@@ -102,6 +102,14 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
+
+    # ★ WIN-FIX 2026-10-01（上游 0.21.3 回归）：QQ Bot REST API 本身没有消息长度
+    #   限制，必须声明分块能力，让 gateway/delivery.py 把完整 payload 透传给适配器
+    #   自行分条发送；否则会被 MAX_PLATFORM_OUTPUT(4000 字符) 截断，cron 的超长输出
+    #   只有前 4000 字送达（实测 2026-10-01：分析报告 24081 字节只推了 15378 后被砍，
+    #   用户看到"后面的内容都没有"）。Hermes 0.21.2 的 QQ 适配器带这行，0.21.3 重构时丢失。
+    splits_long_messages = True
+
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     ALLOW_ALL_ENV_PREFIX = "QQ"
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
@@ -312,8 +320,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         await self._close_ws()
         # Honor proxy env vars for the WebSocket (WSL setups need this).
         self._session = aiohttp.ClientSession(trust_env=gateway_trust_env())
-        proxy_vars = ("WSS_PROXY", "wss_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-        ws_proxy = next((v for v in map(os.getenv, proxy_vars) if v), None)
+        # ★ WIN-FIX 2026-10-08（上游回归）：aiohttp 的 ws_connect(proxy=...) 是显式参数，**不读 NO_PROXY**。
+        #   旧写法无条件把 HTTPS_PROXY 传下去，NO_PROXY 里的 .qq.com 形同虚设：2026-10-08 19:04 Clash(10808)
+        #   抖动 → QQ WS 断连，19:07 起重连 100 次全挂（Upstream SSRF 出站检查同时报 api.sgroup.qq.com
+        #   本地 DNS 失败），20:48 达上限后适配器彻底躺平，推送中断 3.5 小时（19:45–22:40 全部丢失）。
+        #   resolve_proxy_url 按 NO_PROXY 判定：命中即返回 None（直连，api.sgroup.qq.com 国内直连可用）。
+        #   仍保留 WSS_PROXY 的显式覆盖（WSL 场景）。
+        ws_host = urlparse(gateway_url).hostname
+        ws_proxy = os.getenv("WSS_PROXY") or os.getenv("wss_proxy") or resolve_proxy_url(
+            "QQ_PROXY", target_hosts=ws_host)
+        logger.info("[%s] WebSocket proxy: %s (host=%s)", self._log_tag,
+                    ws_proxy or "direct (NO_PROXY match / no proxy env)", ws_host)
         self._ws = await self._session.ws_connect(
             gateway_url, headers={"User-Agent": build_user_agent()}, timeout=CONNECT_TIMEOUT_SECONDS, proxy=ws_proxy,
         )

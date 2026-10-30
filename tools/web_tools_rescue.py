@@ -118,6 +118,114 @@ def _rescue_search(provider_name: str, original_error: str, query: str, limit: i
     }
 
 
+def _configured_fallback_names(kind: str) -> list[str]:
+    """Ordered backend names from ``web.<kind>_fallbacks`` (else the shared ``web.backend``).
+
+    Accepts a YAML list, a comma-separated string, or a bracketed string. These are extra
+    ladder rungs tried for ONE call when the configured primary fails — the same one-shot,
+    never-cached semantics as the keyless rescue, which stays as the last resort behind them.
+    Key name matches upstream's ``web.search_fallbacks`` / ``web.extract_fallbacks`` proposal.
+    """
+    from tools.web_tools import _load_web_config
+
+    cfg = _load_web_config()
+    raw = cfg.get(f"{kind}_fallbacks", cfg.get("backend"))
+    if isinstance(raw, str):
+        text = raw.strip().strip("[]")
+        raw = [part for part in text.split(",")] if text else []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    names: list[str] = []
+    for item in raw:
+        name = str(item or "").strip().strip("\"'").strip().lower()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _fallback_search(provider, original_error: str, query: str, limit: int):
+    """Serve this call from the first working ``web.search_fallbacks`` rung; None if none worked."""
+    from tools import web_tools as _wt
+
+    primary = getattr(provider, "name", "")
+    for name in _configured_fallback_names("search"):
+        if name == primary:
+            continue
+        fallback = _wt._registered_web_provider(name)
+        if fallback is None or not getattr(fallback, "supports_search", lambda: False)():
+            logger.debug("web.search_fallbacks '%s' is not a registered search backend; skipped", name)
+            continue
+        try:
+            resp = fallback.search(query, limit)
+        except Exception as exc:
+            logger.warning("web.search_fallbacks '%s' raised: %s", name, exc)
+            continue
+        if not resp.get("success"):
+            logger.warning("web.search_fallbacks '%s' failed too: %s", name, str(resp.get("error", ""))[:200])
+            continue
+        logger.warning(
+            "web_search backend '%s' failed (%s); served this call from web.search_fallbacks '%s'",
+            primary, (original_error or "")[:200], name,
+        )
+        resp.setdefault("data", {}).update(
+            fallback_backend=name,
+            fallback_from=primary,
+            backend_error=(
+                f"Primary backend '{primary}' failed this call ({(original_error or 'unknown error')[:300]}); "
+                f"result served by web.search_fallbacks '{name}'. The next call will use '{primary}' again."
+            ),
+        )
+        return resp
+    return None
+
+
+async def _fallback_extract(provider, urls: list, failed_results: list, *, format=None):
+    """Serve a failed extract batch from ``web.extract_fallbacks`` rungs, in order.
+
+    Returns the replacement document list (request order preserved by the provider) or None when
+    every rung failed; the caller then hands off to the keyless rescue. Fallback output is never
+    cached, matching rescue semantics.
+    """
+    import asyncio
+    import inspect
+
+    from tools import web_tools as _wt
+
+    primary = getattr(provider, "name", "")
+    original_error = next((r.get("error") for r in failed_results if r.get("error")), "extract failed")
+    for name in _configured_fallback_names("extract"):
+        if name == primary:
+            continue
+        fallback = _wt._registered_web_provider(name)
+        if fallback is None or not getattr(fallback, "supports_extract", lambda: False)():
+            logger.debug("web.extract_fallbacks '%s' is not a registered extract backend; skipped", name)
+            continue
+        try:
+            if inspect.iscoroutinefunction(fallback.extract):
+                docs = await fallback.extract(list(urls), format=format)
+            else:
+                docs = await asyncio.to_thread(fallback.extract, list(urls), format=format)
+        except Exception as exc:
+            logger.warning("web.extract_fallbacks '%s' raised: %s", name, exc)
+            continue
+        docs = [d for d in (docs or []) if isinstance(d, dict)]
+        if not any(not d.get("error") for d in docs):
+            logger.warning("web.extract_fallbacks '%s' failed for every URL too", name)
+            continue
+        logger.warning(
+            "web_extract backend '%s' failed (%s); served this call from web.extract_fallbacks '%s'",
+            primary, (original_error or "")[:200], name,
+        )
+        for doc in docs:
+            meta = doc.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                meta["fallback_backend"] = name
+                meta["fallback_from"] = primary
+                meta["backend_error"] = (original_error or "")[:300]
+        return docs
+    return None
+
+
 def _policy_blocked_result(result: dict) -> bool:
     """True for a website-policy refusal — intentional, never rescued (it would fetch blocked content)."""
     error = str(result.get("error") or "").lower()

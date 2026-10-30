@@ -1,0 +1,7 @@
+name: web-deepseek
+version: 1.0.0
+description: "DeepSeek Search + Fetch (api.deepseek.com/v1/tools) — search and page-to-Markdown extract, billed per successful request. Requires DEEPSEEK_API_KEY."
+author: goldm66
+kind: backend
+provides_web_providers:
+  - deepseek

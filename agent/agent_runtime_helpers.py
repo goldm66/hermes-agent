@@ -3424,6 +3424,30 @@ _TRAILING_CONTINUE_INTENT_RE = re.compile(
     r"[^.!?\n]{0,100}[.:\u2026]?\s*$", re.IGNORECASE,
 )
 
+# CJK branch of the same detector. The English alternation above never matches a zh reply, so a
+# model that closed its turn on 「我继续跑调试脚本。」/「继续推进。」 stalled the turn exactly like
+# the English case this guard exists for (measured: three consecutive finish_reason=stop turns in a
+# 597-message zh session, no "Stall guard" log line ever emitted). Same shape as the English rule:
+# a continuation marker must sit next to an action verb AND the match must reach the end of the
+# message, so a finished report ("任务已完成，所有测试通过。") or a question ("需要我继续吗？") stays safe.
+_CJK_CONTINUE_MARKERS = (
+    "继续", "接着", "马上", "立刻", "这就", "现在", "接下来", "下一步", "然后", "先",
+)
+_CJK_MARKER_CHOICES = _CJK_CONTINUE_MARKERS
+_CJK_CONTINUE_MARKER = "(?:" + "|".join(_CJK_CONTINUE_MARKERS) + ")"
+_CJK_ACTION_VERB = (
+    r"(?:跑|执行|修|改|抓|查|做|试|处理|调试|验证|查看|检查|看|写|建|重启|运行|测试"
+    r"|排查|推进|动手|开始|定位|分析|重试|更新|优化|重新)"
+)
+# Short gap: never spans a sentence break, so a marker in one clause cannot borrow the verb of the next.
+_CJK_CLAUSE_GAP = r"[^。！？!?；;\n]{0,8}?"
+_TRAILING_CONTINUE_INTENT_CJK_RE = re.compile(
+    r"(?:" + r"我" + _CJK_CLAUSE_GAP + _CJK_CONTINUE_MARKER + _CJK_CLAUSE_GAP
+    + r"|" + _CJK_CONTINUE_MARKER + _CJK_CLAUSE_GAP + r")"
+    + _CJK_ACTION_VERB
+    + r"[^。！？!?\n]{0,40}[。！？!?…]?\s*$"
+)
+
 # Content longer than this is a substantive reply, not a dangling ack.
 _TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
 
@@ -3433,7 +3457,30 @@ def trailing_continue_intent(text: str) -> bool:
     t = (text or "").strip()
     if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
         return False
-    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
+    tail = t[-160:]
+    if _TRAILING_CONTINUE_INTENT_RE.search(tail):
+        return True
+    for _m in _TRAILING_CONTINUE_INTENT_CJK_RE.finditer(tail):
+        # Scope the qualifier lookbehind to everything before the continuation marker — including
+        # the marker's own gap ("我不会**继续**跑"), which a fixed lookbehind window misses.
+        _matched = _m.group(0)
+        _marker_at = min(
+            (i for i in (_matched.find(mk) for mk in _CJK_MARKER_CHOICES) if i >= 0),
+            default=0,
+        )
+        _before = tail[max(0, _m.start() - 6):_m.start() + _marker_at]
+        _rest = tail[_m.start():]
+        # Second-person continuations ("你可以继续跑测试") are advice to the user, not a promise.
+        if any(p in _before for p in ("你", "您")):
+            continue
+        # Negated continuations ("我不会继续跑这个任务了") promise the opposite.
+        if any(n in _before for n in ("不", "没", "别", "莫")):
+            continue
+        # Questions ("下一步怎么做。", "先跑测试再改代码吧，你觉得呢？") are not a promise to act.
+        if any(q in _rest for q in ("怎么", "如何", "为什么", "为何", "什么", "哪", "吗", "呢", "是否")):
+            continue
+        return True
+    return False
 
 
 # Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered

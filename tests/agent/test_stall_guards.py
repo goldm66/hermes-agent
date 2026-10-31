@@ -380,6 +380,38 @@ def test_ignores_conversational_future_offers():
     )
 
 
+# ── CJK branch: zh replies stalled the same way the English rule exists to catch ──
+
+
+def test_detects_trailing_cjk_continue_intent():
+    # Verbatim text from a zh session that ended three consecutive turns on
+    # finish_reason=stop with no tool calls, and no stall-guard log line: the
+    # English-only regex never matched.
+    assert trailing_continue_intent(
+        "**现在先把登录稳定下来**，再去聊天页抓发送按钮真实 DOM。我继续跑调试脚本。"
+    )
+    assert trailing_continue_intent("我继续跑调试脚本。")
+    assert trailing_continue_intent("继续推进。")
+    assert trailing_continue_intent("我现在就去修复发送按钮选择器。")
+    assert trailing_continue_intent("接下来我会抓取发送按钮的真实 DOM 结构。")
+    assert trailing_continue_intent("下一步我去执行登录流程的调试。")
+    assert trailing_continue_intent("马上重启适配器验证一下。")
+    assert trailing_continue_intent("我先把它跑起来。")
+
+
+def test_ignores_cjk_finished_reports_and_questions():
+    assert not trailing_continue_intent("任务已完成，所有测试通过。")
+    assert not trailing_continue_intent("登录失败，页面停留在登录页。")
+    assert not trailing_continue_intent("需要我继续吗？")
+    assert not trailing_continue_intent("下一步怎么做。")
+    # Advice to the user, not a promise by the model.
+    assert not trailing_continue_intent("你可以继续跑测试来验证。")
+    assert not trailing_continue_intent("您可以继续执行剩余的用例。")
+    # Negated continuation promises the opposite.
+    assert not trailing_continue_intent("我不会继续跑这个任务了。")
+    assert not trailing_continue_intent("已停止。请告诉我下一步怎么做。")
+
+
 # ── batch-cycle loop breaker (port of can1357/oh-my-pi#10521) ───────────────
 
 

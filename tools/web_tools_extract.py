@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
-from tools.web_tools_rescue import _rescue_eligible, _rescue_extract
+from tools.web_tools_rescue import _fallback_extract, _rescue_eligible, _rescue_extract
 
 logger = logging.getLogger("tools.web_tools")
 
@@ -169,16 +169,27 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
                        provider.name, timeout, len(fetch_urls))
         failed = [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {provider.name}")
                   for u in fetch_urls]
+        fallback = await _fallback_extract(provider, fetch_urls, failed, format=format)
+        if fallback is not None:
+            return fallback
         if not _rescue_eligible(provider):
             return failed
         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
     except Exception as exc:
+        failed = [_result_entry(u, str(exc)) for u in fetch_urls]
+        # Configured ladder rungs (web.extract_fallbacks) sit between the primary and the free tier.
+        fallback = await _fallback_extract(provider, fetch_urls, failed, format=format)
+        if fallback is not None:
+            return fallback
         if not _rescue_eligible(provider):
             raise
-        failed = [_result_entry(u, str(exc)) for u in fetch_urls]
         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
-    if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
+    if results and all(r.get("error") for r in results):
+        fallback = await _fallback_extract(provider, fetch_urls, results, format=format)
+        if fallback is not None:
+            return fallback
+        if _rescue_eligible(provider):
+            return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
 
     # Cache each successful fetch under the REQUESTED url it reports as its own — never by list
     # position: providers omit failed URLs or return successes out of request order, and a positional

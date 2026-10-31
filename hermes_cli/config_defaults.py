@@ -393,6 +393,12 @@ DEFAULT_CONFIG = {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        # Ordered backup backends walked for ONE call when the configured primary fails, before the
+        # keyless rescue (e.g. ["ddgs"] behind a paid search backend, or ["deepseek"] behind a free
+        # one). List, comma string, or "[a, b]". Never cached, never sticky: the next call uses the
+        # primary again. Empty = primary only.
+        "search_fallbacks": [],
+        "extract_fallbacks": [],
         # per-page char budget for web_extract; larger pages truncate, full text kept in cache/web
         "extract_char_limit": 15000,
         # Keyless free-tier ring: with NO web backend configured or keyed, web_search/web_extract

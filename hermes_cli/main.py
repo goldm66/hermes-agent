@@ -1478,6 +1478,58 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                     sys.exit(1)
 
 
+def _fork_occupied_resume(args, *, use_tui: bool) -> None:
+    """Continue an occupied session as a NEW branch instead of refusing.
+
+    ``-c`` / ``--resume`` normally die with "This chat is open in another Hermes
+    window/terminal" when another live surface owns the target's lease. Interactive
+    callers get the session's full transcript copied into a fresh session they own
+    (``hermes_cli.session_fork``) so the second window can work on the same history
+    without two writers interleaving in one conversation. One-shot / programmatic
+    callers keep the hard refusal: silently answering a copy is worse than failing.
+
+    Opt out with ``session.fork_occupied_resume: false``.
+    """
+    session_id = getattr(args, "resume", None)
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    if (getattr(args, "query", None) or getattr(args, "query_file", None)
+            or getattr(args, "oneshot", False)):
+        return
+    if not use_tui:
+        try:
+            if not sys.stdin.isatty():
+                return
+        except Exception:
+            return
+    try:
+        from hermes_cli.config import load_config
+
+        if ((load_config() or {}).get("session") or {}).get("fork_occupied_resume", True) is False:
+            return
+    except Exception:
+        pass
+    try:
+        from hermes_cli.session_fork import fork_session_copy, session_owner_pid
+    except Exception:  # missing module: keep the plain refusal path intact
+        logger.debug("session_fork unavailable", exc_info=True)
+        return
+    owner = session_owner_pid(session_id)
+    if owner is None:
+        return
+    try:
+        branch_id = fork_session_copy(session_id)
+    except Exception as exc:
+        # Fall through to the normal lease refusal, which explains the ownership.
+        logger.warning("Could not fork occupied session %s: %s", session_id, exc)
+        return
+    print(
+        f"↪ 会话 {session_id} 正在另一个窗口使用（pid {owner}），已复制为新分支 {branch_id} 继续。",
+        file=sys.stderr,
+    )
+    args.resume = branch_id
+
+
 def _apply_in_dir(args) -> None:
     """--in DIR: chdir first so workspace-scoped lookups key off DIR; pins the session there."""
     in_dir = getattr(args, "in_dir", None)
@@ -1536,6 +1588,8 @@ def _resolve_chat_session_args(args, use_tui: bool) -> None:
     _resolve_continue_arg(args, use_tui=use_tui)
 
     from hermes_cli.main_resume_args import import_foreign_resume, recreate_resumed_tui_worktree
+    _fork_occupied_resume(args, use_tui=use_tui)
+
     import_foreign_resume(args)
 
     resume_val = getattr(args, "resume", None)
@@ -3445,6 +3499,16 @@ def _default_to_chat(args) -> None:
 def main():
     """Main entry point for hermes CLI."""
     _set_process_title()
+    # Lifecycle witness: write start/signal/exit to logs/cli-lifecycle.log BEFORE
+    # any fast-path launch. A TUI that disappears with no traceback, no dump and
+    # no "Interrupt requested" record leaves nothing to diagnose — a "start" line
+    # with no matching "exit" names the culprit (a hard kill runs no atexit, while
+    # a window close / logoff arrives as CTRL_CLOSE/LOGOFF). Never raises.
+    try:
+        from hermes_cli import lifecycle_log
+        lifecycle_log.install()
+    except Exception:
+        pass
     _warn_if_unsupervised_pid1()
     _advertise_agent_env()
 

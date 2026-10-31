@@ -181,13 +181,26 @@ def _truncate_results(results: list[dict], char_limit: int, debug_call_data: dic
             logger.info("%s (%d chars, whole)", url, len(clean))
 
 
+# Metadata keys that explain HOW an entry was served (configured-fallback / keyless-rescue
+# provenance). They are the only signal the caller gets that a page came from a backup backend,
+# so the trim rebuild below must carry them through — url/title/content/error alone drops them.
+_DIAGNOSTIC_META_KEYS = ("fallback_backend", "fallback_from", "rescued_from", "backend_error", "fetcher")
+
+
 def _trim_results(results: list[dict]) -> list[dict]:
-    """Keep only url/title/content/error per entry (+ blocked_by_policy when present)."""
-    return [
-        {
+    """Keep url/title/content/error per entry (+ blocked_by_policy, + provenance metadata)."""
+    trimmed = []
+    for r in results:
+        entry = {
             "url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""),
             "error": r.get("error"),
-            **({"blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
         }
-        for r in results
-    ]
+        if "blocked_by_policy" in r:
+            entry["blocked_by_policy"] = r["blocked_by_policy"]
+        meta = r.get("metadata")
+        if isinstance(meta, dict):
+            kept = {k: meta[k] for k in _DIAGNOSTIC_META_KEYS if meta.get(k)}
+            if kept:
+                entry["metadata"] = kept
+        trimmed.append(entry)
+    return trimmed

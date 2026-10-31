@@ -20,7 +20,7 @@ from plugins.web.firecrawl.provider import _is_tool_gateway_ready, check_firecra
 from tools.debug_helpers import DebugSession
 from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection, selection_exists
 from tools.url_safety import async_is_safe_url
-from tools.web_tools_rescue import _fallback_search, _managed_search_fallback, _rescue_eligible, _rescue_search
+from tools.web_tools_rescue import _managed_search_fallback, _rescue_eligible, _rescue_search
 from tools.web_tools_truncate import _effective_char_limit, _trim_results, _truncate_results, convert_base64_images_to_links
 from tools.web_tools_extract import (
     _extract_safe_urls, _merge_in_order, _no_provider_error, _resolve_extract_provider, _result_entry,
@@ -375,11 +375,6 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
         fallback = _managed_search_fallback(provider, error, query, fetch_limit)
         if fallback is not None:
             return fallback
-        # Configured ladder rungs (web.search_fallbacks) sit between the primary and the free tier:
-        # an explicit paid backup beats the anonymous keyless ring.
-        fallback = _fallback_search(provider, error, query, fetch_limit)
-        if fallback is not None:
-            return fallback
         return _rescue_search(provider.name, error, query, fetch_limit) if _rescue_eligible(provider) else None
 
     response_data = search_memo.lookup(provider.name, query, limit)
@@ -519,7 +514,7 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": "Search the web: returns titles, URLs and snippets (5 by default). Read pages with web_extract. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -541,7 +536,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
+    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails, times out, or needs JS, login or clicks, use a browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {

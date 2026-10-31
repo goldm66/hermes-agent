@@ -1920,8 +1920,8 @@ def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
 
 def _profile_for_base_url(base_url: str) -> Any | None:
     """Registered profile whose own base_url is a prefix of ``base_url`` (provider name did not
-    resolve). Prefix, not equality: the replaced copilot-acp branch keyed on
-    ``startswith("acp://copilot")``, so a path or user override under the same root must resolve."""
+    resolve). Prefix, not equality: an ACP profile's ``acp://<vendor>`` root must also resolve a
+    path or user override under the same root."""
     try:
         from providers import list_providers
         candidates = list_providers()
@@ -1935,21 +1935,21 @@ def _profile_for_base_url(base_url: str) -> Any | None:
     return None
 
 
-def _ensure_copilot_headers(client_kwargs: dict) -> None:
+def _ensure_route_client_headers(client_kwargs: dict, provider: str) -> None:
     """Defense-in-depth: recovery/restore rebuild from a snapshot without re-running header
-    wiring; a missing Copilot-Integration-Id causes model_not_available_for_integrator 400s.
-    Only ADD missing keys, never override."""
-    try:
-        if base_url_host_matches(str(client_kwargs.get("base_url", "")), "githubcopilot.com"):
-            from hermes_cli.models import copilot_default_headers
-            existing = dict(client_kwargs.get("default_headers") or {})
-            existing_lower = {k.lower() for k in existing}
-            for hk, hv in copilot_default_headers().items():
-                if hk.lower() not in existing_lower:
-                    existing[hk] = hv
-            client_kwargs["default_headers"] = existing
-    except Exception:
-        _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
+    wiring, and a route whose provider requires its client headers (integration ids) 400s
+    without them. Only ADD missing keys, never override."""
+    from agent.provider_route_hooks import route_answer
+    required = route_answer("client_headers", provider=provider, base_url=str(client_kwargs.get("base_url", "")),
+                            api_key=str(client_kwargs.get("api_key", "") or ""))
+    if not required:
+        return
+    existing = dict(client_kwargs.get("default_headers") or {})
+    existing_lower = {k.lower() for k in existing}
+    for hk, hv in required.items():
+        if hk.lower() not in existing_lower:
+            existing[hk] = hv
+    client_kwargs["default_headers"] = existing
 
 
 def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: str, shared: bool):
@@ -2074,7 +2074,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # (init, switch_model, recovery, restore, request-scoped); auxiliary_client builds its own clients and
     # keeps SDK retries because it is NOT wrapped by the conversation loop.
     client_kwargs.setdefault("max_retries", 0)
-    _ensure_copilot_headers(client_kwargs)
+    _ensure_route_client_headers(client_kwargs, str(getattr(agent, "provider", "") or ""))
     # All primary construction and recovery paths must identify Hermes to the official Codex
     # endpoint, including snapshots with custom header overrides.
     from agent.codex_headers import apply_required_codex_headers
@@ -3180,12 +3180,10 @@ def looks_like_codex_intermediate_ack(
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
     if not assistant_text or len(assistant_text) > 1200:
         return False
-    # Some tool-using providers narrate the next action in terse log style
-    # rather than with a first-person lead-in: "Brief written. Creating the
-    # session now." Bare gerunds are too ambiguous ("Reading the traceback
-    # explains the failure" is a final answer), so this path also requires an
-    # explicit transition cue such as "now", "via acpx", "actual log", or
-    # "then launching". Completed reports and questions stay final.
+    # Some tool-using providers narrate the next action in terse log style: "Brief written. Creating the
+    # session now." Bare gerunds are too ambiguous ("Reading the traceback explains the failure" is a final
+    # answer), so this path also requires an explicit transition cue such as "now", "on <ACP agent> via acpx",
+    # "actual log", or "then launching". Completed reports and questions stay final.
     action_clause_pattern = re.compile(
         r"(?:^|[.!…—–]\s+|\n+\s*|,\s+then\s+)"
         r"(?:(?P<transition>then)\s+)?"
@@ -3227,13 +3225,14 @@ def looks_like_codex_intermediate_ack(
         r"\s+now\s*[—–-]\s*see\s+https?://\S+"
         r"(?:\s+for\s+progress)?\s*$"
     )
+    from providers import list_providers  # "relaunching it on <an ACP agent: its name, alias or binary>"
+    provider_names = sorted({n.lower() for p in list_providers() if p.auth_type == "external_process"
+                             for n in (p.name, *p.aliases, p.process_command) if n})
     provider_tail_pattern = re.compile(
         r"\s+(?:it|(?:the\s+)?(?:session|worker|agent|job|process))\s+"
-        r"on\s+copilot(?:\s+via\s+acpx)?\s*$"
+        rf"on\s+(?:{'|'.join(map(re.escape, provider_names)) or '(?!)'})(?:\s+via\s+acpx)?\s*$"
     )
-    actual_log_tail_pattern = re.compile(
-        r"\s+(?:the\s+)?actual\s+(?:log|output)\s*$"
-    )
+    actual_log_tail_pattern = re.compile(r"\s+(?:the\s+)?actual\s+(?:log|output)\s*$")
     health_check_tail_pattern = re.compile(
         r"\s+whether\b.*\b(?:healthy|ready|running|available|reachable|working)\s*$"
     )
@@ -3383,30 +3382,6 @@ _TRAILING_CONTINUE_INTENT_RE = re.compile(
     r"[^.!?\n]{0,100}[.:\u2026]?\s*$", re.IGNORECASE,
 )
 
-# CJK branch of the same detector. The English alternation above never matches a zh reply, so a
-# model that closed its turn on 「我继续跑调试脚本。」/「继续推进。」 stalled the turn exactly like
-# the English case this guard exists for (measured: three consecutive finish_reason=stop turns in a
-# 597-message zh session, no "Stall guard" log line ever emitted). Same shape as the English rule:
-# a continuation marker must sit next to an action verb AND the match must reach the end of the
-# message, so a finished report ("任务已完成，所有测试通过。") or a question ("需要我继续吗？") stays safe.
-_CJK_CONTINUE_MARKERS = (
-    "继续", "接着", "马上", "立刻", "这就", "现在", "接下来", "下一步", "然后", "先",
-)
-_CJK_MARKER_CHOICES = _CJK_CONTINUE_MARKERS
-_CJK_CONTINUE_MARKER = "(?:" + "|".join(_CJK_CONTINUE_MARKERS) + ")"
-_CJK_ACTION_VERB = (
-    r"(?:跑|执行|修|改|抓|查|做|试|处理|调试|验证|查看|检查|看|写|建|重启|运行|测试"
-    r"|排查|推进|动手|开始|定位|分析|重试|更新|优化|重新)"
-)
-# Short gap: never spans a sentence break, so a marker in one clause cannot borrow the verb of the next.
-_CJK_CLAUSE_GAP = r"[^。！？!?；;\n]{0,8}?"
-_TRAILING_CONTINUE_INTENT_CJK_RE = re.compile(
-    r"(?:" + r"我" + _CJK_CLAUSE_GAP + _CJK_CONTINUE_MARKER + _CJK_CLAUSE_GAP
-    + r"|" + _CJK_CONTINUE_MARKER + _CJK_CLAUSE_GAP + r")"
-    + _CJK_ACTION_VERB
-    + r"[^。！？!?\n]{0,40}[。！？!?…]?\s*$"
-)
-
 # Content longer than this is a substantive reply, not a dangling ack.
 _TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
 
@@ -3416,30 +3391,7 @@ def trailing_continue_intent(text: str) -> bool:
     t = (text or "").strip()
     if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
         return False
-    tail = t[-160:]
-    if _TRAILING_CONTINUE_INTENT_RE.search(tail):
-        return True
-    for _m in _TRAILING_CONTINUE_INTENT_CJK_RE.finditer(tail):
-        # Scope the qualifier lookbehind to everything before the continuation marker — including
-        # the marker's own gap ("我不会**继续**跑"), which a fixed lookbehind window misses.
-        _matched = _m.group(0)
-        _marker_at = min(
-            (i for i in (_matched.find(mk) for mk in _CJK_MARKER_CHOICES) if i >= 0),
-            default=0,
-        )
-        _before = tail[max(0, _m.start() - 6):_m.start() + _marker_at]
-        _rest = tail[_m.start():]
-        # Second-person continuations ("你可以继续跑测试") are advice to the user, not a promise.
-        if any(p in _before for p in ("你", "您")):
-            continue
-        # Negated continuations ("我不会继续跑这个任务了") promise the opposite.
-        if any(n in _before for n in ("不", "没", "别", "莫")):
-            continue
-        # Questions ("下一步怎么做。", "先跑测试再改代码吧，你觉得呢？") are not a promise to act.
-        if any(q in _rest for q in ("怎么", "如何", "为什么", "为何", "什么", "哪", "吗", "呢", "是否")):
-            continue
-        return True
-    return False
+    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
 
 
 # Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered

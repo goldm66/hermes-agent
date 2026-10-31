@@ -44,6 +44,7 @@ from agent.inline_tool_executors import (
     tool_hook_ids,
 )
 from agent.message_metadata import stamp_data_use
+from agent.session_persistence import sync_rewritten_tool_rows
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -977,13 +978,7 @@ def _run_sequential_tool_execution_middleware(
             )
         else:
             assert timeout_s is not None  # only reachable when a deadline exists
-            message = (
-                f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s. "
-                "A command that waits for input (an interactive prompt or menu) never returns in this "
-                "environment — if that is what hung, re-run it non-interactively (its --yes/--summary "
-                "style flag, or a non-interactive tool) instead of retrying the same command. Any later "
-                "call of this batch was skipped."
-            )
+            message = f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s"
             logger.warning("sequential tool %s timed out after %.1fs", function_name, timeout_s)
             result_cls, outcome = _ToolTimeoutResult, dict(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
@@ -994,14 +989,11 @@ def _run_sequential_tool_execution_middleware(
             # prepared command into overlapping execution.
             prepared.batch.close()
             if state == "timeout":
-                # Abandon the REST OF THIS BATCH instead of interrupting the turn. The runner
-                # then skips this batch's unstarted calls (each keeps a matching tool result)
-                # and the model keeps its turn: it sees the timeout on the next API call and
-                # decides whether to retry, switch approach or redirect. Interrupting here ended
-                # the whole turn with no reply at all — a bare "Operation interrupted."
-                # placeholder the user could not act on, for one slow command.
-                agent._tool_batch_abandoned = True
-                agent._tool_batch_abandoned_reason = f"{function_name} timed out after {timeout_s:.1f}s"
+                # Label the abort as the batch guard's own, not a user stop (#130207). No message:
+                # ``_interrupt_message`` is what gateway/CLI re-queue as the user's next turn. On the
+                # interrupted branch the stop is already published; re-interrupting would rebook it
+                # and null the user's queued message and redirect.
+                agent.interrupt(tool_reason="terminal batch timeout")
         future.cancel()
         if state == "timeout":
             _interrupt_worker_tids(agent, worker_tid)
@@ -1234,6 +1226,7 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     contents_before = [message.get("content") for message in batch]
     enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
     plugin_live_notes.keep_after_turn_budget(agent, batch)
+    sync_rewritten_tool_rows(agent, batch, contents_before)
     record_tool_batch(agent, batch, contents_before)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
@@ -1756,26 +1749,10 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     )
 
 
-def _batch_abandon_reason(agent) -> Optional[str]:
-    """Why the current tool batch must skip its unstarted calls, or ``None``.
-
-    Set by the sequential timeout path (``_run_sequential_tool_execution_middleware``): a
-    timed-out tool must not let a later prepared command of the SAME batch start (the wedged
-    shell may still be unwinding), but the turn itself survives — the model gets the timeout
-    result plus one "skipped" result per remaining call and decides what to do next. Ending
-    the turn instead (the older ``agent.interrupt``) produced a turn with no reply at all and
-    a bare "Operation interrupted." placeholder the user could not act on.
-    """
-    if getattr(agent, "_tool_batch_abandoned", False):
-        return str(getattr(agent, "_tool_batch_abandoned_reason", "") or "previous tool did not complete")
-    return None
-
-
-def _skip_remaining_sequential(agent, messages: list, remaining, effective_task_id: str, *, notice: str,
-                               banner: str = "⚡ Interrupt: skipping", **skip_kwargs) -> bool:
-    """Announce why the rest of the batch is skipped and append one skipped result per
-    unstarted call; False when a flush failed (the caller must stop the batch)."""
-    agent._vprint(f"{agent.log_prefix}{banner} {len(remaining)} {notice}", force=True)
+def _skip_remaining_sequential(agent, messages: list, remaining, effective_task_id: str, *, notice: str, **skip_kwargs) -> bool:
+    """Announce an interrupt and append one skipped result per unstarted call; False when
+    a flush failed (the caller must stop the batch)."""
+    agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {len(remaining)} {notice}", force=True)
     return _append_skipped_tool_results(agent, messages, remaining, effective_task_id, **skip_kwargs)
 
 
@@ -1890,12 +1867,6 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
-    if finalize:
-        # Top-level entry for one assistant tool batch: a batch abandoned at the previous
-        # API call (timed-out tool) must not leak into this one. The segmented dispatcher
-        # resets at its own entry and calls the segments with finalize=False.
-        agent._tool_batch_abandoned = False
-        agent._tool_batch_abandoned_reason = ""
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
             _execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, effective_task_id, api_call_count, finalize=False)
@@ -1916,17 +1887,12 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         # Check interrupt BEFORE each tool so a "stop" during the previous one skips the rest.
-        # An abandoned batch (a timeout earlier in this same batch) skips the rest too, but it
-        # is NOT a user stop: the turn survives and continues with the timeout result.
-        _abandon = _batch_abandon_reason(agent)
-        if agent._interrupt_requested or _abandon:
+        if agent._interrupt_requested:
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i - 1:], effective_task_id,
                 notice="tool call(s)",
-                content=(f"[Tool execution skipped — {{name}} was not started. {_abandon}.]" if _abandon
-                         else f"[Tool execution cancelled — {{name}} was skipped. {interrupt_skip_wording(agent)}]"),
-                banner="⚡ Tool batch abandoned:" if _abandon else "⚡ Interrupt: skipping",
-                hook_error_type=None if _abandon else "user_interrupt",
+                content=f"[Tool execution cancelled — {{name}} was skipped. {interrupt_skip_wording(agent)}]",
+                hook_error_type="user_interrupt",
                 hook_id=lambda tc: getattr(tc, "id", "") or "",
                 flush_stage="cancelled tool result",
             ):
@@ -1954,14 +1920,11 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
                                           budget=_tool_budget, transform_applied=dispatch.transform_applied):
             return
 
-        _abandon = _batch_abandon_reason(agent)
-        if (agent._interrupt_requested or _abandon) and i < len(tool_calls):
+        if agent._interrupt_requested and i < len(tool_calls):
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i:], effective_task_id,
                 notice="remaining tool call(s)",
-                content=(f"[Tool execution skipped — {{name}} was not started. {_abandon}.]" if _abandon
-                         else f"[Tool execution skipped — {{name}} was not started. {interrupt_skip_wording(agent)}]"),
-                banner="⚡ Tool batch abandoned:" if _abandon else "⚡ Interrupt: skipping",
+                content=f"[Tool execution skipped — {{name}} was not started. {interrupt_skip_wording(agent)}]",
                 flush_stage="skipped tool result",
             ):
                 return
@@ -1978,11 +1941,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     once here (segments run with ``finalize=False``); each segment executor checks the
     interrupt flag up front, so an interrupt drains later segments with one result per call."""
     from types import SimpleNamespace
-
-    # One assistant tool batch starts here (segments are dispatched with finalize=False):
-    # a batch abandoned at a previous API call (timed-out tool) must not leak into this one.
-    agent._tool_batch_abandoned = False
-    agent._tool_batch_abandoned_reason = ""
 
     if segments is None:
         _active_env = get_active_env(effective_task_id)

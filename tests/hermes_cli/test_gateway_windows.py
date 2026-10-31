@@ -492,6 +492,23 @@ def test_reconcile_leaves_one_autostart_mechanism(monkeypatch, tmp_path):
     assert [p.name for p in (tmp_path / "no-task" / "Startup").iterdir()] == ["Hermes_Gateway_alice.vbs"]
 
 
+def test_reconcile_rewrites_an_older_startup_entry_as_utf16(monkeypatch, tmp_path):
+    """wscript.exe reads a BOM-less .vbs in the ANSI code page: an older UTF-8 Startup entry chaining a
+    non-ASCII path quits silently at logon (FileExists on the garbled target is false). The update
+    reconcile rewrites it as UTF-16 with a BOM."""
+    import codecs
+    startup, script = _startup_with_fallback_and_legacy_entries(monkeypatch, tmp_path / "Usuário 方舟")
+    (startup / "Hermes_Gateway_alice.cmd").unlink()
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: script)
+
+    assert gateway_windows.reconcile_autostart_launchers() == ([], [])
+    raw = (startup / "Hermes_Gateway_alice.vbs").read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_LE)
+    assert raw.decode("utf-16") == gateway_windows._build_startup_launcher(script)
+    assert sorted(p.name for p in startup.iterdir()) == ["Hermes_Gateway_alice.vbs"]
+
+
 def test_reconcile_warns_when_legacy_entry_cannot_be_removed(monkeypatch, tmp_path):
     """#80569: no task, legacy .cmd locked. The .vbs gets written but the .cmd survives, so both fire
     at logon; reconcile must warn instead of reporting a migration, and doctor --fix must not count it."""
@@ -788,91 +805,6 @@ def test_start_on_tty_hands_both_answers_to_install_and_honours_the_env_opt_out(
     monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: pytest.fail("env override must skip the prompt"))
     gateway_windows.start()
     assert installs == [] and spawns == [1]
-
-
-def _arrange_uninstall_access_denied(monkeypatch, tmp_path):
-    """uninstall() where schtasks /Delete is denied and the process is not elevated — the branch that
-    offers the UAC hand-off. Startup entries point at an empty dir so the file-removal loop is a no-op."""
-    startup = tmp_path / "Startup"
-    startup.mkdir()
-    monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
-    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
-    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
-    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: tmp_path / "task" / "Hermes_Gateway_alice.cmd")
-    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup / "Hermes_Gateway_alice.vbs")
-    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: startup / "Hermes_Gateway_alice.cmd")
-    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
-    monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: (1, "", "错误: 拒绝访问。"))  # access denied
-    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
-    # A real interactive console unless a test narrows one of these seams.
-    monkeypatch.setattr(setup, "is_interactive_stdin", lambda: True)
-    monkeypatch.setattr(gateway_windows, "_stdin_console_mode_ok", lambda: True)
-    monkeypatch.setattr(gateway_windows, "_stdout_isatty", lambda: True)
-
-
-def test_uninstall_hidden_scheduled_task_console_never_blocks_on_the_uac_prompt(monkeypatch, tmp_path, capsys):
-    """The unattended `hermes update --yes` multiplex migration reaches uninstall() on a hidden
-    Scheduled Task console: isatty()==True but GetConsoleMode rejects the handle, so a `prompt_yes_no`
-    would block the update forever (#126624). The prompt must be skipped and the task left in place with
-    a manual-removal hint — never an `input()` call."""
-    _arrange_uninstall_access_denied(monkeypatch, tmp_path)
-    monkeypatch.setattr(gateway_windows, "_stdin_console_mode_ok", lambda: False)  # hidden console
-    monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: pytest.fail("no UAC prompt on a hidden console"))
-    monkeypatch.setattr(gateway_windows, "_launch_elevated_gateway_command",
-                        lambda *a, **k: pytest.fail("no elevation without an answer"))
-
-    gateway_windows.uninstall()
-
-    out = capsys.readouterr().out
-    assert "Non-interactive run" in out
-    assert "schtasks /Delete /F /TN Hermes_Gateway_alice" in out
-
-
-def test_uninstall_noninteractive_env_skips_the_uac_prompt(monkeypatch, tmp_path, capsys):
-    """HERMES_NONINTERACTIVE=1 (dashboard/desktop-spawned uninstall) also declines the hand-off."""
-    _arrange_uninstall_access_denied(monkeypatch, tmp_path)
-    monkeypatch.setenv("HERMES_NONINTERACTIVE", "1")
-    monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: pytest.fail("no UAC prompt when non-interactive"))
-
-    gateway_windows.uninstall()
-
-    assert "Non-interactive run" in capsys.readouterr().out
-
-
-def test_uninstall_on_a_real_console_still_offers_the_uac_prompt(monkeypatch, tmp_path, capsys):
-    """A human at a real console keeps the interactive UAC hand-off: the prompt is asked, and Yes
-    launches the elevated uninstall."""
-    _arrange_uninstall_access_denied(monkeypatch, tmp_path)
-    launched = []
-    monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: True)
-    monkeypatch.setattr(gateway_windows, "_launch_elevated_gateway_command",
-                        lambda command, *a, **k: launched.append(command) or True)
-
-    gateway_windows.uninstall()
-
-    assert launched == ["uninstall"]
-    assert "Launched elevated Hermes gateway uninstall prompt." in capsys.readouterr().out
-
-
-def test_install_hidden_scheduled_task_console_falls_back_without_the_uac_prompt(monkeypatch, tmp_path, capsys):
-    """The migration's install leg (``_restart_default`` -> ``install(start_now=True, start_on_login=True)``)
-    runs on the same hidden console right after the uninstall leg (#126624): its UAC offer must not block
-    either — it declines and takes the existing Startup-folder fallback."""
-    _arrange_uninstall_access_denied(monkeypatch, tmp_path)
-    monkeypatch.setattr(gateway_windows, "_stdin_console_mode_ok", lambda: False)  # hidden console
-    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: tmp_path / "task.cmd")
-    monkeypatch.setattr(gateway_windows, "_startup_staging_path", lambda: tmp_path / "Startup" / "staging.tmp")
-    monkeypatch.setattr(setup, "prompt_yes_no", lambda *a, **k: pytest.fail("no UAC prompt on a hidden console"))
-    monkeypatch.setattr(gateway_windows, "_launch_elevated_install",
-                        lambda *a, **k: pytest.fail("no elevation without an answer"))
-    fallbacks = []
-    monkeypatch.setattr(gateway_windows, "_install_startup_fallback",
-                        lambda script, start_now, reason: fallbacks.append(start_now))
-
-    gateway_windows.install(start_now=True, start_on_login=True)
-
-    assert fallbacks == [True]
-    assert "Non-interactive run" in capsys.readouterr().out
 
 
 

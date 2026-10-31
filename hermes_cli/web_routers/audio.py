@@ -17,11 +17,12 @@ import os
 import urllib.parse
 import urllib.request
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from hermes_cli.dashboard_auth.native_http import grant_home_scope
 from hermes_cli.web_routers._common import http_failure
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
 from hermes_cli.web_server_gateway import _read_dashboard_json_response, _split_text_for_speak_stream
+from hermes_cli.web_session_sockets import SPEAK_STREAM_SOCKET, TRANSCRIBE_STREAM_SOCKET
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from hermes_cli.web_models import (
     AudioTranscriptionRequest,
@@ -53,10 +54,6 @@ _SPEAK_MIME_BY_EXT = {
     ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav",
     ".flac": "audio/flac",
 }
-
-# How often /api/audio/speak emits a whitespace heartbeat while synthesising. Must stay
-# well under the desktop client's timeout(180_000 ms floor) so the socket never looks idle.
-_SPEAK_KEEPALIVE_SECONDS = float(os.environ.get("HERMES_SPEAK_KEEPALIVE_SECONDS", "20"))
 
 
 def _unlink_quietly(path: str) -> None:
@@ -302,45 +299,11 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     Used by the desktop voice-conversation mode to play back assistant
     responses without exposing the on-disk file path; reuses the TTS provider
     chain configured under ``tts.`` in config.yaml.
-
-    The response is STREAMED with a whitespace heartbeat. The desktop client's
-    ``req.setTimeout`` is a socket *inactivity* timeout, not a total-duration one, so a
-    single long blocking response dies with "Timed out connecting to Hermes backend after
-    180000ms" whenever local synthesis outruns the client's size-based budget (a local
-    model needs ~1200 ms/char against the client's 35 ms/char allowance). Emitting one
-    space every ``_SPEAK_KEEPALIVE_SECONDS`` keeps the socket active; leading whitespace
-    is legal before a JSON value, so the client's ``JSON.parse`` still succeeds and one
-    request can carry a full-length reply.
     """
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
-    async def _stream():
-        task = asyncio.ensure_future(_build_speak_response(text, profile))
-        try:
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=_SPEAK_KEEPALIVE_SECONDS)
-                if done:
-                    break
-                yield b" "  # heartbeat: keeps the client socket from idling out
-            try:
-                body = task.result()
-            except HTTPException as exc:
-                body = {"ok": False, "error": exc.detail}
-            except Exception as exc:  # noqa: BLE001 - surface any synthesis failure as JSON
-                _log.warning("speak_text stream failed: %s", exc)
-                body = {"ok": False, "error": str(exc) or "Speech synthesis failed"}
-        finally:
-            if not task.done():
-                task.cancel()
-        yield json.dumps(body, ensure_ascii=False).encode("utf-8")
-
-    return StreamingResponse(_stream(), media_type="application/json")
-
-
-async def _build_speak_response(text: str, profile: Optional[str]) -> Dict[str, Any]:
-    """Synthesize ``text`` and base64-encode it; the original endpoint body."""
     # _config_profile_scope raises 400/404 for a bad profile — pass it
     # through instead of masking it as a 500 synthesis failure.
     with http_failure("Desktop voice TTS failed", 500, "Speech synthesis failed"):
@@ -564,21 +527,23 @@ async def transcribe_stream_ws(ws: WebSocket) -> None:
                ``{"type": "error", "message": ...}`` — also when no live STT is available, so the
                client falls back to ``POST /api/audio/transcribe`` with its recorded blob.
     """
-    if not _ws_auth_ok(ws):
+    # A socket ticket opens this stream only when minted for it (``/api/webapp/socket-ticket``).
+    if not _ws_auth_ok(ws, socket=TRANSCRIBE_STREAM_SOCKET):
         await ws.close(code=4401)
         return
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
-    await ws.accept()
+    await ws.accept(subprotocol=getattr(ws, "_hermes_ws_subprotocol", None))
 
     profile = (ws.query_params.get("profile") or "").strip() or None
+    grant = getattr(ws, "_hermes_native_grant", None)
     loop = asyncio.get_running_loop()
     partials: asyncio.Queue = asyncio.Queue()
 
     def _open():
         from tools.transcription_streaming import open_streaming_session
-        with _config_profile_scope(profile):
+        with grant_home_scope(grant), _config_profile_scope(profile):
             return open_streaming_session(on_partial=lambda text: loop.call_soon_threadsafe(partials.put_nowait, text))
 
     session = None
@@ -617,7 +582,11 @@ async def transcribe_stream_ws(ws: WebSocket) -> None:
         session.cancel()
         forwarder.cancel()
         return
-    result = await loop.run_in_executor(None, session.finalize)
+    def _finalize():
+        with grant_home_scope(grant), _config_profile_scope(profile):
+            return session.finalize()
+
+    result = await loop.run_in_executor(None, _finalize)
     await asyncio.sleep(0)  # let the last partial flush before the final frame
     forwarder.cancel()
     with contextlib.suppress(Exception):
@@ -650,25 +619,28 @@ async def speak_stream_ws(ws: WebSocket) -> None:
                still speak per sentence via ``text_to_speech_tool`` and stream
                that PCM — the client POST is the last resort, not the Edge path.
     """
-    if not _ws_auth_ok(ws):
+    # A socket ticket opens this stream only when minted for it (``/api/webapp/socket-ticket``).
+    if not _ws_auth_ok(ws, socket=SPEAK_STREAM_SOCKET):
         await ws.close(code=4401)
         return
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
-    await ws.accept()
+    await ws.accept(subprotocol=getattr(ws, "_hermes_ws_subprotocol", None))
 
     # Profile via query param, like /api/pty and /api/console: the provider
     # chain + API keys must resolve from the requesting profile's config, not
-    # the dashboard's own — at resolve time AND in the synthesis thread.
+    # the dashboard's own — at resolve time AND in the synthesis thread. A
+    # native grant's home owns the implicit selector (its explicit ones match it).
     profile = (ws.query_params.get("profile") or "").strip() or None
+    grant = getattr(ws, "_hermes_native_grant", None)
 
     loop = asyncio.get_running_loop()
 
     def _resolve():
         from tools.tts_streaming import resolve_streaming_provider
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
-        with _config_profile_scope(profile):
+        with grant_home_scope(grant), _config_profile_scope(profile):
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
             cap = _resolve_max_text_length(_get_provider(cfg), cfg)
@@ -710,7 +682,7 @@ async def speak_stream_ws(ws: WebSocket) -> None:
         # Every streamer re-resolves its API key on each stream() call (tts_streaming ->
         # resolve_provider_secret), so the whole synthesis body runs under the requesting
         # profile's scope, not only the resolve step above (else the launch profile's key).
-        with _config_profile_scope(profile):
+        with grant_home_scope(grant), _config_profile_scope(profile):
             _synthesize()
 
     def _synthesize():
